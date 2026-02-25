@@ -320,9 +320,11 @@ class DocumentParser:
         """Run all parsing passes and return company data dict keyed by canonical name."""
         # Pass 1: Extract company identities (ENTITY/FILING lines)
         self._pass_identity()
-        # Pass 1b: If no ENTITY/FILING found, extract identities from prose
+        # Pass 1b: If no ENTITY/FILING found, try prose identity
         if not self.companies:
             self._pass_prose_identity()
+        # Pass 1c: Try executive profiles format
+        self._pass_executive_profiles()
         # Pass 2: Build comprehensive name lookup
         self._build_name_lookup()
         # Pass 3: Parse all data lines
@@ -615,6 +617,202 @@ class DocumentParser:
                         c.is_public = False
                 continue
 
+    def _pass_executive_profiles(self):
+        """Parse EXECUTIVE PROFILES format documents.
+
+        Uses a two-pass approach:
+        Pass 1: Process identity lines (**Name** — Title, Company (DBA). HQ: ...)
+                and (**Name** runs Company out of City, Country. ...) to register
+                companies, DBA codes, and aliases. Then rebuild name lookup.
+        Pass 2: Process data lines (key ratios, quarterly performance, year unfolded,
+                numbers that keep reappearing, DBA: status lines) using the
+                now-populated name lookup for DBA code resolution.
+        """
+        # Check if this is an executive profiles format document
+        has_bold_names = any(re.search(r'\*\*[A-Z][a-z]+\s+[A-Z][a-z]+\*\*', line) for line in self.lines)
+        if not has_bold_names:
+            return
+
+        # Pre-register known company names
+        for kn in self.known_names:
+            kn = kn.strip()
+            if kn:
+                self._ensure_company(kn)
+                self._register_alias(kn, kn)
+                words = kn.split()
+                if len(words) > 1:
+                    self._register_alias(words[0], kn)
+
+        # Pass 1: Process identity lines
+        for line in self.lines:
+            line = line.strip()
+            if not line:
+                continue
+            if is_counterfactual(line):
+                continue
+
+            # Pattern 1: **Name** — Title, Company (DBA). HQ: City, Country. Sector: X.
+            m = re.match(
+                r'\*\*([A-Z][a-z]+\s+[A-Z][a-z]+)\*\*\s*[—\-]+\s*(.+?),\s*(.+?)\s*\((\w+)\)\.\s*HQ:\s*(\w+),\s*(\w+)\.\s*Sector:\s*(.+?)\.',
+                line
+            )
+            if m:
+                ceo_name = m.group(1).strip()
+                # title = m.group(2).strip()  # not needed
+                company_name = m.group(3).strip()
+                dba = m.group(4).strip()
+                city = m.group(5).strip()
+                country = m.group(6).strip()
+                sector = m.group(7).strip()
+                c = self._ensure_company(company_name)
+                if not c.ceo_full_name:
+                    c.ceo_full_name = ceo_name
+                    c.ceo_last_name = ceo_name.split()[-1]
+                c.dba = dba
+                c.hq_city = city
+                c.hq_country = country
+                c.sector = sector
+                self._register_alias(dba, company_name)
+                words = company_name.split()
+                if len(words) > 1:
+                    self._register_alias(words[0], company_name)
+                continue
+
+            # Pattern 2: **Name** runs Company out of City, Country. Colleagues sometimes refer to the business as DBA.
+            m = re.match(
+                r'\*\*([A-Z][a-z]+\s+[A-Z][a-z]+)\*\*\s+runs\s+(.+?)\s+out\s+of\s+(\w+),\s*(\w+)\.\s*Colleagues\s+sometimes\s+refer\s+to\s+the\s+business\s+as\s+(\w+)\.',
+                line
+            )
+            if m:
+                ceo_name = m.group(1).strip()
+                company_name = m.group(2).strip()
+                city = m.group(3).strip()
+                country = m.group(4).strip()
+                dba = m.group(5).strip()
+                c = self._ensure_company(company_name)
+                if not c.ceo_full_name:
+                    c.ceo_full_name = ceo_name
+                    c.ceo_last_name = ceo_name.split()[-1]
+                c.hq_city = city
+                c.hq_country = country
+                if not c.dba:
+                    c.dba = dba
+                self._register_alias(dba, company_name)
+                words = company_name.split()
+                if len(words) > 1:
+                    self._register_alias(words[0], company_name)
+                continue
+
+        # Rebuild name lookup with newly registered companies and DBA codes
+        self._build_name_lookup()
+
+        # Pass 2: Process data lines
+        for line in self.lines:
+            line = line.strip()
+            if not line:
+                continue
+            if is_counterfactual(line):
+                continue
+            # Skip identity lines (already processed)
+            if line.startswith('**') or line.startswith('#'):
+                continue
+
+            # Pattern 3: Company key ratios: D/E X; satisfaction Y/10. Headcount N.
+            m = re.match(r'^(.+?)\s+key\s+ratios\s*:\s*(.+)$', line, re.IGNORECASE)
+            if m:
+                prefix = m.group(1).strip()
+                remainder = m.group(2).strip()
+                resolved = self._resolve_company(prefix)
+                if resolved:
+                    c = self._ensure_company(resolved)
+                    de_m = re.search(r'D/E\s*([\d.]+)', remainder)
+                    if de_m:
+                        c.de_ratio = float(de_m.group(1))
+                    sat_m = re.search(r'satisfaction\s*([\d.]+)(?:\s*/\s*10)?', remainder, re.IGNORECASE)
+                    if sat_m:
+                        c.satisfaction = float(sat_m.group(1))
+                    hc_m = re.search(r'[Hh]eadcount\s+(?:close\s+to|approximately|just\s+over|just\s+under|nearly|roughly|about|around)?\s*([\d,]+)', remainder)
+                    if hc_m:
+                        c.employees = int(hc_m.group(1).replace(',', ''))
+                continue
+
+            # Pattern 4: Company quarterly performance: Q1 XM (grew/fell N%); ...
+            m = re.match(r'^(.+?)\s+quarterly\s+performance\s*:\s*(.+)$', line, re.IGNORECASE)
+            if m:
+                prefix = m.group(1).strip()
+                remainder = m.group(2).strip()
+                resolved = self._resolve_company(prefix)
+                if resolved:
+                    c = self._ensure_company(resolved)
+                    self._extract_quarterly_data(c, remainder)
+                continue
+
+            # Pattern 5: For DBA, the year unfolded in quarters: ...
+            m = re.match(r'^For\s+(\w+),\s+the\s+year\s+unfolded\s+in\s+quarters\s*:\s*(.+)$', line, re.IGNORECASE)
+            if m:
+                prefix = m.group(1).strip()
+                remainder = m.group(2).strip()
+                resolved = self._resolve_company(prefix)
+                if resolved:
+                    c = self._ensure_company(resolved)
+                    self._extract_quarterly_data(c, remainder)
+                continue
+
+            # Pattern 6: For Company, numbers that keep reappearing: debt-to-equity X, satisfaction Y, employees N.
+            m = re.match(r'^For\s+(.+?),\s+numbers\s+that\s+keep\s+reappearing\s*:\s*(.+)$', line, re.IGNORECASE)
+            if m:
+                prefix = m.group(1).strip()
+                remainder = m.group(2).strip()
+                resolved = self._resolve_company(prefix)
+                if resolved:
+                    c = self._ensure_company(resolved)
+                    de_m = re.search(r'debt-to-equity\s*([\d.]+)', remainder, re.IGNORECASE)
+                    if de_m:
+                        c.de_ratio = float(de_m.group(1))
+                    sat_m = re.search(r'satisfaction\s*([\d.]+)', remainder, re.IGNORECASE)
+                    if sat_m:
+                        c.satisfaction = float(sat_m.group(1))
+                    emp_m = re.search(r'employees?\s+(?:close\s+to|approximately|just\s+over|just\s+under|nearly|roughly|about|around)?\s*([\d,]+)', remainder, re.IGNORECASE)
+                    if emp_m:
+                        c.employees = int(emp_m.group(1).replace(',', ''))
+                continue
+
+            # Pattern 7: DBA: went public in YYYY. Founded in YYYY.
+            # or: DBA: remains privately held. Founded in YYYY.
+            m = re.match(r'^(\w+)\s*:\s*(went\s+public|remains?\s+privately)', line, re.IGNORECASE)
+            if m:
+                prefix = m.group(1).strip()
+                resolved = self._resolve_company(prefix)
+                if resolved:
+                    c = self._ensure_company(resolved)
+                    ipo_m = re.search(r'went\s+public\s+in\s+(\d{4})', line, re.IGNORECASE)
+                    if ipo_m:
+                        c.is_public = True
+                        c.ipo_year = int(ipo_m.group(1))
+                    elif re.search(r'remains?\s+(?:privately\s+held|private)', line, re.IGNORECASE):
+                        c.is_public = False
+                        c.ipo_year = 0
+                    fm = re.search(r'[Ff]ounded\s+(?:in\s+)?(\d{4})', line)
+                    if fm:
+                        c.founded_year = int(fm.group(1))
+                continue
+
+            # Pattern: Company was founded YYYY; went public/remains private
+            m = re.match(r'^(.+?)\s+was\s+founded\s+(?:in\s+)?(\d{4})', line, re.IGNORECASE)
+            if m:
+                prefix = m.group(1).strip()
+                resolved = self._resolve_company(prefix)
+                if resolved:
+                    c = self._ensure_company(resolved)
+                    c.founded_year = int(m.group(2))
+                    ipo_m = re.search(r'went\s+public\s+in\s+(\d{4})', line, re.IGNORECASE)
+                    if ipo_m:
+                        c.is_public = True
+                        c.ipo_year = int(ipo_m.group(1))
+                    elif re.search(r'remains?\s+(?:privately\s+held|private)', line, re.IGNORECASE):
+                        c.is_public = False
+                continue
+
     def _match_known_name(self, text: str) -> Optional[str]:
         """Try to match text to a known company name from challenge metadata."""
         t = text.strip()
@@ -837,7 +1035,7 @@ class DocumentParser:
     def _try_parse_ratios(self, line: str):
         """Parse ratios/disclosure lines for D/E, satisfaction, employees."""
         # Check if line contains ratio keywords
-        if not re.search(r'(?:RATIOS|DISCLOSURE|D/E|[Dd]ebt.to.equity|[Ss]atisfaction)', line):
+        if not re.search(r'(?:RATIOS|DISCLOSURE|D/E|[Dd]ebt.to.equity|[Ss]atisfaction|[Hh]eadcount)', line):
             return
 
         company_name, remainder = self._resolve_line_prefix(line)
@@ -869,6 +1067,15 @@ class DocumentParser:
         )
         if emp_m:
             c.employees = int(emp_m.group(1).replace(',', ''))
+
+        # Headcount (alternative employee count keyword)
+        if not emp_m:
+            hc_m = re.search(
+                r'[Hh]eadcount\s+(?:approximately|nearly|roughly|about|close\s+to|just\s+over|just\s+under|around)?\s*([\d,]+)',
+                remainder
+            )
+            if hc_m:
+                c.employees = int(hc_m.group(1).replace(',', ''))
 
 
     def _try_parse_revenue(self, line: str):
@@ -1004,6 +1211,7 @@ class DocumentParser:
         """Extract growth rate from a revenue segment.
 
         Handles: (+25%), (-12%), (0%), / +25%, / -12%
+        Also handles prose: (grew by 23 percent), (fell 10%), / contracted by 15 percent, etc.
         """
         # Parenthesized: (+25%) or (-12%) or (0%)
         m = re.search(r'\(\s*([+-]?\d+(?:\.\d+)?)\s*%\s*\)', segment)
@@ -1014,6 +1222,28 @@ class DocumentParser:
         m = re.search(r'/\s*([+-]?\d+(?:\.\d+)?)\s*%', segment)
         if m:
             return float(m.group(1))
+
+        # Prose growth in parentheses: (grew by 23 percent) or (fell 10%) or (expanded 36%)
+        m = re.search(r'\(\s*(?:grew\s+by|expanded|increased)\s+(\d+(?:\.\d+)?)\s*(?:%|percent)\s*\)', segment, re.IGNORECASE)
+        if m:
+            return float(m.group(1))
+        m = re.search(r'\(\s*(?:fell|declined|contracted\s+by|shrank)\s+(\d+(?:\.\d+)?)\s*(?:%|percent)\s*\)', segment, re.IGNORECASE)
+        if m:
+            return -float(m.group(1))
+        m = re.search(r'\(\s*was\s+unchanged\s*\)', segment, re.IGNORECASE)
+        if m:
+            return 0.0
+
+        # Slash-separated prose: / contracted by 15 percent or / expanded 14%
+        m = re.search(r'/\s*(?:grew\s+by|expanded|increased)\s+(\d+(?:\.\d+)?)\s*(?:%|percent)', segment, re.IGNORECASE)
+        if m:
+            return float(m.group(1))
+        m = re.search(r'/\s*(?:fell|declined|contracted\s+by|shrank)\s+(\d+(?:\.\d+)?)\s*(?:%|percent)', segment, re.IGNORECASE)
+        if m:
+            return -float(m.group(1))
+        m = re.search(r'/\s*was\s+unchanged', segment, re.IGNORECASE)
+        if m:
+            return 0.0
 
         return None
 
@@ -2433,7 +2663,7 @@ WORD_BANK = {
     'n': ['nail', 'nod', 'norm', 'null', 'numb', 'nook', 'nick', 'noon', 'nova', 'nub'],
     'o': ['oath', 'omit', 'oral', 'orb', 'oust', 'oval', 'oxid', 'opal', 'opus', 'orca'],
     'p': ['palm', 'pint', 'plot', 'port', 'pulp', 'push', 'pact', 'pawn', 'plum', 'pond'],
-    'q': ['quip', 'quiz', 'quod', 'quilt', 'quart', 'quirk', 'quota', 'quail', 'qualm', 'quash'],
+    'q': ['quay', 'quip', 'quit', 'quiz', 'quod', 'quilt', 'quart', 'quirk', 'quota', 'quail', 'qualm', 'quash'],
     'r': ['rank', 'rift', 'rock', 'rust', 'ramp', 'rind', 'roam', 'ruin', 'rung', 'rush'],
     's': ['salt', 'silk', 'slot', 'sort', 'spur', 'stir', 'surf', 'slab', 'slim', 'snap'],
     't': ['tact', 'tilt', 'toll', 'tusk', 'turf', 'tarn', 'tick', 'torn', 'trim', 'twig'],
@@ -2477,7 +2707,7 @@ EXTENDED_WORDS = {
           'ocean', 'olive', 'onset', 'opera', 'orbit', 'organ', 'other', 'outer', 'outdo', 'oxide'],
     'p': ['palm', 'pint', 'plot', 'port', 'pulp', 'push', 'pact', 'pawn', 'plum', 'pond',
           'panel', 'patch', 'pearl', 'pedal', 'pilot', 'pixel', 'plank', 'plaza', 'plumb', 'polar'],
-    'q': ['quip', 'quiz', 'quod', 'quilt', 'quart', 'quirk', 'quota', 'quail', 'qualm', 'quash'],
+    'q': ['quay', 'quip', 'quit', 'quiz', 'quod', 'quilt', 'quart', 'quirk', 'quota', 'quail', 'qualm', 'quash'],
     'r': ['rank', 'rift', 'rock', 'rust', 'ramp', 'rind', 'roam', 'ruin', 'rung', 'rush',
           'radar', 'rally', 'ranch', 'rapid', 'realm', 'reign', 'relay', 'rigid', 'rival', 'robin'],
     's': ['salt', 'silk', 'slot', 'sort', 'spur', 'stir', 'surf', 'slab', 'slim', 'snap',
@@ -2591,23 +2821,37 @@ class ArtifactGenerator:
         """Get a filler word, optionally starting with a specific letter.
 
         Avoids the forbidden letter and tries not to repeat words.
+        When the start letter IS the forbidden letter (e.g., acrostic requires 'q'
+        but 'q' is forbidden), we allow the starting letter but check that the
+        rest of the word doesn't contain the forbidden letter.
         """
         forbidden = self.forbidden_letter.lower() if self.forbidden_letter else ''
         used = set(w.lower() for w in existing_words if w)
 
         if start_letter:
             sl = start_letter.lower()
+            # Check if start letter is the forbidden letter — special handling
+            start_is_forbidden = (forbidden and sl == forbidden)
             # Try extended word bank first
             candidates = EXTENDED_WORDS.get(sl, WORD_BANK.get(sl, []))
             for word in candidates:
-                if forbidden and forbidden in word.lower():
-                    continue
+                if start_is_forbidden:
+                    # Allow the starting letter, but check rest of word
+                    if forbidden in word[1:].lower():
+                        continue
+                else:
+                    if forbidden and forbidden in word.lower():
+                        continue
                 if word.lower() not in used:
                     return word
-            # If all used, allow repeats but still avoid forbidden
+            # If all used, allow repeats but still avoid forbidden (with same logic)
             for word in candidates:
-                if forbidden and forbidden in word.lower():
-                    continue
+                if start_is_forbidden:
+                    if forbidden in word[1:].lower():
+                        continue
+                else:
+                    if forbidden and forbidden in word.lower():
+                        continue
                 return word
             # Last resort: construct a word
             return self._construct_word(sl, forbidden)
@@ -2642,10 +2886,7 @@ class ArtifactGenerator:
         if not consonants:
             consonants = ['n']
 
-        # If start letter IS the forbidden letter, pick a safe alternative
-        if start.lower() == forbidden.lower():
-            start = consonants[0] if start not in 'aeiou' else vowels[0]
-
+        # Keep the start letter even if it's the forbidden letter (acrostic may require it)
         if start in 'aeiou':
             return start + consonants[0] + vowels[0] + consonants[1 % len(consonants)]
         else:
@@ -2664,10 +2905,17 @@ class ArtifactGenerator:
                 # Check if this is a required element (can't easily replace)
                 is_required = any(word.lower() in elem.lower() for elem in self.required_elements)
 
-                if is_required:
-                    # Required element contains forbidden letter — try to find synonym
-                    # For now, keep it (the challenge may expect this)
-                    dbg(f"  WARNING: Required element '{word}' contains forbidden letter '{forbidden}'")
+                # Check if this is an acrostic position where the required letter IS the forbidden letter
+                is_acrostic_forced = (i < len(self.acrostic) and
+                                      self.acrostic[i].lower() == forbidden and
+                                      word[0].lower() == forbidden)
+
+                if is_required or is_acrostic_forced:
+                    # Required element or acrostic-forced letter — keep it
+                    if is_acrostic_forced:
+                        dbg(f"  Keeping '{word}' at acrostic position {i} (forced letter '{forbidden}')")
+                    else:
+                        dbg(f"  WARNING: Required element '{word}' contains forbidden letter '{forbidden}'")
                     result.append(word)
                 else:
                     # Replace with safe filler
@@ -2714,10 +2962,14 @@ class ArtifactGenerator:
         if self.forbidden_letter:
             fl = self.forbidden_letter.lower()
             # Check non-required words
-            for word in words:
+            for idx, word in enumerate(words):
                 if fl in word.lower():
                     is_req = any(word.lower() in elem.lower() for elem in self.required_elements)
-                    if not is_req:
+                    # Also exempt acrostic-forced positions where the required letter IS the forbidden letter
+                    is_acrostic_forced = (idx < len(self.acrostic) and
+                                          self.acrostic[idx].lower() == fl and
+                                          word[0].lower() == fl)
+                    if not is_req and not is_acrostic_forced:
                         errors.append(f"Forbidden letter '{fl}' found in non-required word '{word}'")
 
         all_passed = len(errors) == 0
