@@ -320,6 +320,9 @@ class DocumentParser:
         """Run all parsing passes and return company data dict keyed by canonical name."""
         # Pass 1: Extract company identities (ENTITY/FILING lines)
         self._pass_identity()
+        # Pass 1b: If no ENTITY/FILING found, extract identities from prose
+        if not self.companies:
+            self._pass_prose_identity()
         # Pass 2: Build comprehensive name lookup
         self._build_name_lookup()
         # Pass 3: Parse all data lines
@@ -462,6 +465,180 @@ class DocumentParser:
                 c.short_name = short_name
                 self._register_alias(short_name, full_name)
                 continue
+
+    def _pass_prose_identity(self):
+        """Extract company identities from prose-format documents (no ENTITY/FILING lines).
+
+        Handles formats like:
+        - "COMPANY's PERSON, the TITLE, oversees N employees. Founded YYYY, ..."
+        - "CITY, COUNTRY — COMPANY (known to locals as ...) ..."
+        - "At COMPANY, led by PERSON (TITLE), the firm counts N employees; ..."
+        - "COMPANY has long operated out of CITY, COUNTRY; in SECTOR circles ... called SHORT."
+        - "COMPANY reports a debt-to-equity ratio of X ..."
+        """
+        for line in self.lines:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if is_counterfactual(line):
+                continue
+
+            # Pattern: "COMPANY's PERSON, the TITLE, oversees N employees. Founded YYYY, it went public/remains private."
+            m = re.match(
+                r"^(.+?)'s\s+([A-Z][a-z]+\s+[A-Z][a-z]+),\s+the\s+(?:co-)?(?:ceo|chief executive|managing director|president|founder\s*&?\s*ceo)",
+                line, re.IGNORECASE
+            )
+            if m:
+                company_text = m.group(1).strip()
+                ceo_name = m.group(2).strip()
+                # Try to match to known names
+                resolved = self._match_known_name(company_text)
+                if resolved:
+                    c = self._ensure_company(resolved)
+                    c.ceo_full_name = ceo_name
+                    c.ceo_last_name = ceo_name.split()[-1]
+                    # Parse employees
+                    emp_m = re.search(r'oversees\s+(?:close\s+to|approximately|just\s+over|just\s+under|nearly|roughly|about|around)?\s*([\d,]+)\s*(?:employees|people|staff)', line, re.IGNORECASE)
+                    if emp_m:
+                        c.employees = int(emp_m.group(1).replace(',', ''))
+                    # Parse founded
+                    fm = re.search(r'[Ff]ounded\s+(?:in\s+)?(\d{4})', line)
+                    if fm:
+                        c.founded_year = int(fm.group(1))
+                    # Parse IPO
+                    if re.search(r'went\s+public\s+in\s+(\d{4})', line, re.IGNORECASE):
+                        ipo_m = re.search(r'went\s+public\s+in\s+(\d{4})', line, re.IGNORECASE)
+                        c.is_public = True
+                        c.ipo_year = int(ipo_m.group(1))
+                    elif re.search(r'remains?\s+(?:privately\s+held|private)', line, re.IGNORECASE):
+                        c.is_public = False
+                continue
+
+            # Pattern: "CITY, COUNTRY — COMPANY (known to locals as ...) has been ..."
+            m = re.match(
+                r'^([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?),\s*([A-Z][a-z]+)\s*[—\-]+\s*(.+?)\s*\((?:known|called|referred)',
+                line, re.IGNORECASE
+            )
+            if m:
+                city = m.group(1).strip()
+                country = m.group(2).strip()
+                company_text = m.group(3).strip()
+                resolved = self._match_known_name(company_text)
+                if resolved:
+                    c = self._ensure_company(resolved)
+                    c.hq_city = city
+                    c.hq_country = country
+                    # Extract DBA/short from "known to locals as the COMPANY group"
+                    dba_m = re.search(r'(?:known|called|referred)\s+.*?(?:as\s+(?:the\s+)?)?(\w+)\s+(?:group|team|outfit)', line, re.IGNORECASE)
+                    if dba_m:
+                        short = dba_m.group(1).strip()
+                        if not c.short_name:
+                            c.short_name = short
+                        self._register_alias(short, resolved)
+                    # Extract sector
+                    sec_m = re.search(r'(?:in|within)\s+(?:the\s+)?(\w+(?:\s+\w+)?)\s+(?:sector|industry|space|field)', line, re.IGNORECASE)
+                    if sec_m:
+                        c.sector = sec_m.group(1).strip()
+                continue
+
+            # Pattern: "At COMPANY, led by PERSON (TITLE), the firm counts N employees; founded in YYYY ..."
+            m = re.match(
+                r'^At\s+(.+?),\s+led\s+by\s+([A-Z][a-z]+\s+[A-Z][a-z]+)\s*\((.+?)\)',
+                line, re.IGNORECASE
+            )
+            if m:
+                company_text = m.group(1).strip()
+                ceo_name = m.group(2).strip()
+                resolved = self._match_known_name(company_text)
+                if resolved:
+                    c = self._ensure_company(resolved)
+                    c.ceo_full_name = ceo_name
+                    c.ceo_last_name = ceo_name.split()[-1]
+                    emp_m = re.search(r'(?:counts?|employs?|has)\s+(?:close\s+to|approximately|just\s+over|just\s+under|nearly|roughly|about|around)?\s*([\d,]+)\s*(?:employees|people|staff)', line, re.IGNORECASE)
+                    if emp_m:
+                        c.employees = int(emp_m.group(1).replace(',', ''))
+                    fm = re.search(r'[Ff]ounded\s+(?:in\s+)?(\d{4})', line)
+                    if fm:
+                        c.founded_year = int(fm.group(1))
+                    if re.search(r'went\s+public\s+in\s+(\d{4})', line, re.IGNORECASE):
+                        ipo_m = re.search(r'went\s+public\s+in\s+(\d{4})', line, re.IGNORECASE)
+                        c.is_public = True
+                        c.ipo_year = int(ipo_m.group(1))
+                    elif re.search(r'remains?\s+(?:privately\s+held|private)', line, re.IGNORECASE):
+                        c.is_public = False
+                continue
+
+            # Pattern: "COMPANY has long operated out of CITY, COUNTRY; in SECTOR circles ... called SHORT."
+            m = re.match(
+                r'^(.+?)\s+has\s+long\s+operated\s+out\s+of\s+(\w+),\s*(\w+)',
+                line, re.IGNORECASE
+            )
+            if m:
+                company_text = m.group(1).strip()
+                city = m.group(2).strip()
+                country = m.group(3).strip()
+                resolved = self._match_known_name(company_text)
+                if resolved:
+                    c = self._ensure_company(resolved)
+                    c.hq_city = city
+                    c.hq_country = country
+                    # Extract sector
+                    sec_m = re.search(r'in\s+(\w+(?:\s+\w+)?)\s+(?:circles|sector|industry)', line, re.IGNORECASE)
+                    if sec_m:
+                        c.sector = sec_m.group(1).strip()
+                    # Extract short name
+                    short_m = re.search(r'(?:called|known\s+as|shortened\s+to|just\s+called)\s+(\w+)', line, re.IGNORECASE)
+                    if short_m:
+                        short = short_m.group(1).strip()
+                        if short.lower() not in ('the', 'a', 'an', 'it'):
+                            c.short_name = short
+                            self._register_alias(short, resolved)
+                continue
+
+            # Pattern: "COMPANY was founded YYYY; went public in YYYY / remains privately held."
+            m = re.match(
+                r'^(.+?)\s+was\s+founded\s+(?:in\s+)?(\d{4})',
+                line, re.IGNORECASE
+            )
+            if m:
+                company_text = m.group(1).strip()
+                year = int(m.group(2))
+                resolved = self._match_known_name(company_text)
+                if resolved:
+                    c = self._ensure_company(resolved)
+                    c.founded_year = year
+                    if re.search(r'went\s+public\s+in\s+(\d{4})', line, re.IGNORECASE):
+                        ipo_m = re.search(r'went\s+public\s+in\s+(\d{4})', line, re.IGNORECASE)
+                        c.is_public = True
+                        c.ipo_year = int(ipo_m.group(1))
+                    elif re.search(r'remains?\s+(?:privately\s+held|private)', line, re.IGNORECASE):
+                        c.is_public = False
+                continue
+
+    def _match_known_name(self, text: str) -> Optional[str]:
+        """Try to match text to a known company name from challenge metadata."""
+        t = text.strip()
+        if t.endswith("'s"):
+            t = t[:-2]
+        tl = t.lower()
+
+        # Exact match against known names
+        for kn in self.known_names:
+            if tl == kn.lower():
+                return kn
+
+        # Check if text is a prefix of a known name (e.g., "Opti" for "Opti Sphere")
+        for kn in self.known_names:
+            words = kn.split()
+            if len(words) > 1 and tl == words[0].lower():
+                return kn
+
+        # Check if text contains a known name
+        for kn in self.known_names:
+            if kn.lower() in tl:
+                return kn
+
+        return None
 
     def _build_name_lookup(self):
         """Build comprehensive alias → canonical name lookup table."""
@@ -1810,106 +1987,173 @@ class QuestionEngine:
                 best_name = name
         return best_name
 
+    def _ceo_initial_matches_city(self, q: str, m: re.Match) -> Optional[str]:
+        """CEO first name initial matches HQ city first letter + most employees."""
+        best_name, best_emp = None, -1
+        for name, c in self.companies.items():
+            if not c.ceo_full_name or not c.hq_city:
+                continue
+            ceo_first = c.ceo_full_name.split()[0][0].upper() if c.ceo_full_name.split() else ''
+            city_first = c.hq_city[0].upper() if c.hq_city else ''
+            if ceo_first != city_first:
+                continue
+            dbg(f"      {name}: CEO={c.ceo_full_name}({ceo_first}), city={c.hq_city}({city_first}), emp={c.employees}")
+            if c.employees > best_emp:
+                best_emp = c.employees
+                best_name = name
+        return best_name
+
+    def _satisfaction_plus_avg_growth(self, q: str, m: re.Match) -> Optional[str]:
+        """Satisfaction score + average growth rate combined, highest wins."""
+        best_name, best_score = None, -999.0
+        for name, c in self.companies.items():
+            if c.satisfaction <= 0:
+                continue
+            avg_g = c.avg_growth()
+            score = c.satisfaction + avg_g
+            dbg(f"      {name}: sat={c.satisfaction}, avg_growth={avg_g:.2f}, combined={score:.2f}")
+            if score > best_score:
+                best_score = score
+                best_name = name
+        return best_name
 
     def _fallback_answer(self, q: str) -> Optional[str]:
-        """Fallback handler for questions that don't match specific patterns.
-
-        Uses keyword extraction to determine the question type.
-        """
+        """Fallback handler using broad keyword matching for question types."""
         ql = q.lower()
 
-        # Revenue volatility fallback
-        if 'volatility' in ql and 'revenue' in ql:
-            return self._revenue_volatility(q, None)
+        # --- CEO initial matches city initial ---
+        if ("ceo" in ql or "chief" in ql) and ("initial" in ql or "first letter" in ql or "starts with" in ql) and ("city" in ql or "hq" in ql or "headquarter" in ql):
+            return self._ceo_initial_matches_city(q, None)
 
-        # Employees per revenue fallback
-        if 'employees' in ql and 'per' in ql and 'revenue' in ql:
+        # --- Satisfaction + average growth combined ---
+        if "satisfaction" in ql and ("average" in ql or "avg" in ql) and "growth" in ql and ("combined" in ql or "adding" in ql or "plus" in ql or "sum" in ql or "score" in ql):
+            return self._satisfaction_plus_avg_growth(q, None)
+
+        # --- Revenue volatility ---
+        if "volatility" in ql or ("gap" in ql and "quarter" in ql) or ("difference" in ql and "quarter" in ql and "revenue" in ql) or ("spread" in ql and "revenue" in ql):
+            if "revenue" in ql:
+                return self._revenue_volatility(q, None)
+
+        # --- Employees per revenue ---
+        if ("employees" in ql or "headcount" in ql) and "per" in ql and ("revenue" in ql or "million" in ql):
+            return self._employees_per_revenue(q, None)
+        if "ratio" in ql and ("employees" in ql or "headcount" in ql) and "revenue" in ql:
             return self._employees_per_revenue(q, None)
 
-        # Total revenue fallback
-        if ('total' in ql or 'full-year' in ql or 'full year' in ql or 'all four' in ql) and 'revenue' in ql:
-            if 'highest' in ql or 'largest' in ql or 'most' in ql or 'top' in ql or 'biggest' in ql:
+        # --- Total revenue ---
+        if "revenue" in ql and any(w in ql for w in ["total", "full-year", "full year", "all four", "entire year", "annual", "across all", "four quarters"]):
+            if any(w in ql for w in ["highest", "largest", "most", "top", "biggest", "greatest"]):
                 return self._highest_total_revenue(q, None)
 
-        # Average growth fallback
-        if 'average' in ql and 'growth' in ql:
-            return self._highest_avg_growth(q, None)
+        # --- Average growth ---
+        if ("average" in ql or "averaging" in ql or "mean" in ql) and "growth" in ql:
+            if any(w in ql for w in ["highest", "largest", "best", "greatest", "top"]):
+                return self._highest_avg_growth(q, None)
 
-        # Second oldest fallback
-        if 'second' in ql and ('oldest' in ql or 'earliest' in ql):
+        # --- Second oldest ---
+        if "second" in ql and ("oldest" in ql or "earliest" in ql):
             return self._second_oldest(q, None)
 
-        # Most recent IPO fallback
-        if 'ipo' in ql and ('recent' in ql or 'latest' in ql):
+        # --- Most recent IPO ---
+        if ("ipo" in ql or "went public" in ql) and ("recent" in ql or "latest" in ql or "newest" in ql):
             return self._most_recent_ipo(q, None)
 
-        # Public + lowest D/E fallback
-        if 'public' in ql and ('lowest' in ql or 'smallest' in ql) and ('d/e' in ql or 'debt' in ql):
+        # --- Public + lowest D/E ---
+        is_public_q = any(w in ql for w in ["public", "publicly", "went public", "traded"])
+        is_low = any(w in ql for w in ["lowest", "smallest", "least", "minimum"])
+        is_de = any(w in ql for w in ["d/e", "debt-to-equity", "debt to equity", "leverage"])
+        if is_public_q and is_low and is_de:
             return self._public_lowest_de(q, None)
 
-        # Private + satisfaction fallback
-        if ('private' in ql or 'privately' in ql) and 'satisfaction' in ql:
-            if 'best' in ql or 'highest' in ql or 'top' in ql:
-                return self._private_best_satisfaction(q, None)
+        # --- Private + satisfaction ---
+        is_private_q = any(w in ql for w in ["private", "privately", "remained private"])
+        is_high = any(w in ql for w in ["best", "highest", "top", "greatest"])
+        if is_private_q and "satisfaction" in ql and is_high:
+            return self._private_best_satisfaction(q, None)
 
-        # Private + employees fallback
-        if ('private' in ql or 'privately' in ql) and 'employees' in ql:
-            if 'most' in ql or 'largest' in ql or 'biggest' in ql:
-                return self._private_most_employees(q, None)
+        # --- Private + employees ---
+        is_emp = any(w in ql for w in ["employees", "headcount", "employs", "people", "staff"])
+        is_most = any(w in ql for w in ["most", "largest", "biggest", "greatest", "highest"])
+        if is_private_q and is_emp and is_most:
+            return self._private_most_employees(q, None)
 
-        # Q3 decline + D/E fallback
-        if ('q3' in ql or 'third quarter' in ql) and ('decline' in ql or 'negative' in ql or 'drop' in ql) and ('d/e' in ql or 'debt' in ql):
+        # --- Q3 decline + D/E ---
+        is_q3 = any(w in ql for w in ["q3", "third quarter", "third-quarter", "pre-close"])
+        is_decline = any(w in ql for w in ["decline", "negative", "drop", "decrease", "fell", "loss"])
+        if is_q3 and is_decline and is_de:
             return self._q3_decline_highest_de(q, None)
 
-        # Over X employees + least revenue fallback
-        emp_m = re.search(r'(?:over|more\s+than)\s+([\d,]+)\s+employees?', ql)
-        if emp_m and ('least' in ql or 'lowest' in ql or 'smallest' in ql) and 'revenue' in ql:
+        # --- Over X employees + least revenue ---
+        emp_m = re.search(r'(?:over|more\s+than|exceeding|above|with\s+over)\s+([\d,]+)\s+(?:employees?|people|headcount|staff)', ql)
+        if emp_m and is_low and "revenue" in ql:
             return self._over_employees_least_revenue(q, emp_m)
 
-        # Over $1B + lowest satisfaction fallback
-        if ('billion' in ql or '$1b' in ql or '$1 b' in ql) and 'satisfaction' in ql:
+        # --- Over $1B + lowest satisfaction ---
+        is_over_1b = any(w in ql for w in ["billion", "$1b", "$1 b", "1b total", "1,000"])
+        if is_over_1b and "satisfaction" in ql and ("lowest" in ql or "worst" in ql or "least" in ql):
+            return self._over_1b_lowest_satisfaction(q, None)
+        # Also match "earning more than $1B" or "more than $1 billion"
+        if re.search(r'(?:more\s+than|over|exceeding|above)\s+\$?1\s*(?:billion|b\b)', ql) and "satisfaction" in ql:
             return self._over_1b_lowest_satisfaction(q, None)
 
-        # Sector + founded earliest fallback
+        # --- Sector + founded earliest ---
         sector_m = re.search(r'(?:in\s+the\s+)?(\w+)\s+sector', ql)
-        if sector_m and ('oldest' in ql or 'earliest' in ql or 'founded' in ql):
+        if sector_m and ("oldest" in ql or "earliest" in ql or "first" in ql):
             return self._sector_founded_earliest(q, sector_m)
 
-        # City + Q2 revenue fallback
-        city_m = re.search(r'headquartered\s+in\s+(\w+)', ql)
-        if city_m and ('q2' in ql or 'second quarter' in ql) and 'revenue' in ql:
+        # --- City + Q2 revenue ---
+        city_m = re.search(r'(?:headquartered|based|HQ\'?d?)\s+in\s+(\w+)', ql)
+        if not city_m:
+            city_m = re.search(r'\bin\s+(\w+)\s*,\s*which\s+company\s+(?:posted|had|recorded)', ql)
+        if not city_m:
+            city_m = re.search(r'\bin\s+([A-Z][a-z]+)', q)  # case-sensitive on original
+        if city_m and ("q2" in ql or "second-quarter" in ql or "second quarter" in ql or "mid-spring" in ql) and "revenue" in ql:
             return self._city_highest_q2(q, city_m)
 
-        # Location + employees fallback
-        loc_m = re.search(r'(?:headquartered|HQ|based)\s+in\s+(\w+)', ql)
+        # --- Location + employees ---
+        loc_m = re.search(r'(?:headquartered|HQ\'?d?|based)\s+in\s+(\w+)', ql)
         if not loc_m:
-            loc_m = re.search(r'[Ii]n\s+(\w+)\s*,?\s*which', ql)
-        if loc_m and ('employees' in ql or 'employs' in ql):
+            loc_m = re.search(r'\bin\s+(\w+)\s*,?\s*which\s+(?:HQ|company|firm)', ql)
+        if not loc_m:
+            loc_m = re.search(r'\bin\s+([A-Z][a-z]+)', q)
+        if loc_m and is_emp:
             return self._location_most_employees(q, loc_m)
 
-        # Founded before + Q4 growth fallback
+        # --- Founded before + Q4 growth ---
         before_m = re.search(r'founded\s+(?:before|earlier\s+than|prior\s+to)\s+(\d{4})', ql)
-        if before_m and ('q4' in ql or 'fourth' in ql or 'closing' in ql) and 'growth' in ql:
+        is_q4 = any(w in ql for w in ["q4", "fourth quarter", "fourth-quarter", "closing quarter", "closing-quarter"])
+        if before_m and is_q4 and "growth" in ql:
             return self._founded_before_best_q4_growth(q, before_m)
 
-        # Q1 to Q4 increase fallback
-        if ('q1' in ql or 'first quarter' in ql or 'opening' in ql) and ('q4' in ql or 'fourth quarter' in ql or 'closing' in ql):
-            if 'increase' in ql or 'jump' in ql or 'gain' in ql or 'rise' in ql or 'biggest' in ql or 'largest' in ql:
+        # --- Q1 to Q4 increase ---
+        is_q1 = any(w in ql for w in ["q1", "first quarter", "first-quarter", "opening quarter", "opening-quarter"])
+        if is_q1 and is_q4:
+            if any(w in ql for w in ["increase", "jump", "gain", "rise", "biggest", "largest", "greatest"]):
                 return self._largest_q1_to_q4_increase(q, None)
 
-        # Founded decade + all positive fallback
-        decade_m = re.search(r'founded\s+in\s+the\s+(\d{4})s', ql)
-        if decade_m and ('positive' in ql and 'growth' in ql):
+        # --- Founded decade + all positive ---
+        decade_m = re.search(r'(?:founded\s+)?(?:in\s+)?the\s+(\d{4})s', ql)
+        if decade_m and "positive" in ql and "growth" in ql:
             return self._founded_decade_all_positive(q, decade_m)
 
-        # Public + all positive + fewest employees fallback
-        if 'public' in ql and 'positive' in ql and 'growth' in ql and ('fewest' in ql or 'least' in ql) and 'employees' in ql:
-            return self._public_all_positive_fewest_employees(q, None)
+        # --- Public + all positive + fewest employees ---
+        if is_public_q and "positive" in ql and "growth" in ql and is_emp:
+            if "fewest" in ql or "least" in ql or "smallest" in ql:
+                return self._public_all_positive_fewest_employees(q, None)
 
-        # D/E + satisfaction compound filter fallback
-        de_sat_m = re.search(r'D/E\s+(?:below|under)\s+([\d.]+).*satisfaction\s+(?:above|over)\s+([\d.]+)', ql, re.I)
+        # --- D/E + satisfaction compound filter ---
+        de_sat_m = re.search(r'(?:D/E|debt[\s-]*to[\s-]*equity)\s+(?:below|under|less\s+than)\s+([\d.]+).*satisfaction\s+(?:above|over|greater\s+than|exceeding)\s+([\d.]+)', ql, re.I)
         if de_sat_m:
             return self._de_sat_highest_q4(q, de_sat_m)
+        # Reversed order
+        de_sat_m2 = re.search(r'satisfaction\s+(?:above|over)\s+([\d.]+).*(?:D/E|debt[\s-]*to[\s-]*equity)\s+(?:below|under)\s+([\d.]+)', ql, re.I)
+        if de_sat_m2:
+            # Swap groups to match expected order (de_threshold, sat_threshold)
+            class FakeMatch:
+                def group(self, n):
+                    if n == 1: return de_sat_m2.group(2)
+                    if n == 2: return de_sat_m2.group(1)
+            return self._de_sat_highest_q4(q, FakeMatch())
 
         return None
 
